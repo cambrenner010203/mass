@@ -1,0 +1,512 @@
+---
+title: "Mass Gathering Event Syndromic Surveillance"
+subtitle: "Weekly Situational Update"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  officedown::rdocx_document:
+    reference_docx: "reference_template.docx"
+    tables:
+      style: "Table Grid"
+      caption:
+        style: "Table Caption"
+    plots:
+      style: "Normal"
+      align: "center"
+
+params:
+  # ── Event details ────────────────────────────────────────────────────────────
+  event_name:   "Annual Music Festival"
+  event_start:  "2025-07-11"
+  event_end:    "2025-07-13"
+  analyst_name: "Analyst Name, Title"
+  distribution: "Surveillance Unit, Health Officer, EOC"
+
+  # ── ESSENCE connection ───────────────────────────────────────────────────────
+  essence_base: "https://your-state.syndromicsurveillance.org/essence"
+  datasource:   "va_hosp"
+
+  # ── ESSENCE field names — adjust to match your instance ─────────────────────
+  # Run names(get_api_data(url, profile = myProfile)$dataDetails) to confirm
+  field_cc:       "chiefComplaintOrig"
+  field_icd:      "ddInformationText"
+  field_dd_date:  "ddDate"
+  field_visit_date: "date"
+  field_facility: "facilityName"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 6.5,
+  fig.height = 3.5,
+  dpi     = 150
+)
+
+library(Rnssp)
+library(tidyverse)
+library(flextable)
+library(officer)
+library(officedown)
+library(lubridate)
+library(scales)
+library(glue)
+
+# ── Resolve params ────────────────────────────────────────────────────────────
+EVENT_NAME    <- params$event_name
+EVENT_START   <- as.Date(params$event_start)
+EVENT_END     <- as.Date(params$event_end)
+ESSENCE_BASE  <- params$essence_base
+DATASOURCE    <- params$datasource
+
+FIELD_CC          <- params$field_cc
+FIELD_ICD         <- params$field_icd
+FIELD_DD_DATE     <- params$field_dd_date
+FIELD_VISIT_DATE  <- params$field_visit_date
+FIELD_FACILITY    <- params$field_facility
+
+# ── Derived dates ─────────────────────────────────────────────────────────────
+REPORT_END  <- min(EVENT_END, Sys.Date())   # never requests future data
+YOY_START   <- EVENT_START - years(1)
+YOY_END     <- REPORT_END  - years(1)
+
+api_date <- function(d) format(as.Date(d), "%d%b%Y")
+
+report_label <- glue(
+  "{format(EVENT_START, '%B %d')} \u2013 {format(REPORT_END, '%B %d, %Y')}"
+)
+yoy_label <- glue(
+  "{format(YOY_START, '%B %d')} \u2013 {format(YOY_END, '%B %d, %Y')}"
+)
+next_report_date <- format(REPORT_END + days(7), "%B %d, %Y")
+
+# ── flextable defaults ────────────────────────────────────────────────────────
+set_flextable_defaults(font.family = "Arial", font.size = 10)
+```
+
+```{r auth, include=FALSE}
+# Credentials pulled from .Renviron — never hardcode in the script
+# Run usethis::edit_r_environ() and add:
+#   ESSENCE_USER=you@health.gov
+#   ESSENCE_PASS=yourpassword
+
+myProfile <- create_profile(
+  username = Sys.getenv("ESSENCE_USER"),
+  password = Sys.getenv("ESSENCE_PASS")
+)
+```
+
+```{r pull_timeseries, include=FALSE}
+build_ts_url <- function(start, end) {
+  glue(
+    "{ESSENCE_BASE}/api/timeSeries",
+    "?endDate={api_date(end)}",
+    "&startDate={api_date(start)}",
+    "&percentParam=noPercent",
+    "&datasource={DATASOURCE}",
+    "&smoothing=0",
+    "&graphOnly=true",
+    "&timeResolution=daily",
+    "&hasBeenE=1",
+    "&medicalGroupingSystem=essencesyndromes",
+    "&aqtTarget=TimeSeries"
+  )
+}
+
+parse_ts <- function(raw, period_label) {
+  raw$timeSeriesData %>%
+    as_tibble() %>%
+    mutate(
+      date   = as.Date(date, "%m/%d/%Y"),
+      count  = as.numeric(count),
+      period = period_label
+    )
+}
+
+ts_current     <- get_api_data(build_ts_url(EVENT_START, REPORT_END), profile = myProfile) %>%
+  parse_ts("This Year")
+
+ts_yoy         <- get_api_data(build_ts_url(YOY_START, YOY_END), profile = myProfile) %>%
+  parse_ts("Prior Year (YOY)")
+
+# Shift YOY dates forward one year so both series share the same x-axis
+ts_yoy_aligned <- ts_yoy %>% mutate(date = date + years(1))
+ts_combined    <- bind_rows(ts_current, ts_yoy_aligned)
+
+# Daily comparison table
+ts_table <- ts_current %>%
+  select(date, count) %>%
+  rename(current = count) %>%
+  left_join(
+    ts_yoy_aligned %>% select(date, count) %>% rename(yoy = count),
+    by = "date"
+  ) %>%
+  mutate(
+    pct_change   = if_else(
+      is.na(yoy) | yoy == 0, NA_real_,
+      round((current - yoy) / yoy * 100, 1)
+    ),
+    change_label = case_when(
+      is.na(pct_change) ~ "N/A",
+      pct_change  > 0   ~ glue("+{pct_change}%"),
+      TRUE              ~ glue("{pct_change}%")
+    ),
+    flag         = !is.na(pct_change) & pct_change > 20,
+    date_label   = format(date, "%a %b %d")
+  )
+```
+
+```{r pull_cc, include=FALSE}
+build_cc_url <- function(start, end) {
+  glue(
+    "{ESSENCE_BASE}/api/dataDetails",
+    "?endDate={api_date(end)}",
+    "&startDate={api_date(start)}",
+    "&datasource={DATASOURCE}",
+    "&hasBeenE=1",
+    "&medicalGroupingSystem=essencesyndromes",
+    "&aqtTarget=DataDetails"
+  )
+}
+
+classify_cc <- function(cc_text) {
+  cc <- tolower(cc_text)
+  case_when(
+    str_detect(cc, "heat|hypertherm|overheated|heat exhaustion|heat stroke")        ~ "Heat Illness",
+    str_detect(cc, "lacerat|fractur|fall|blunt|trauma|mvc|stab|gsw|assault|fight") ~ "Traumatic Injury",
+    str_detect(cc, "intox|etoh|drunk|alcohol|passed out|altered")                  ~ "Alcohol / ETOH",
+    str_detect(cc, "nausea|vomit|diarrhea|abdominal|abd pain|food poison|n/v")     ~ "Food Poisoning / GI",
+    str_detect(cc, "overdose|ingestion|opioid|fentanyl|narcan|naloxone")           ~ "Drug Toxicity",
+    str_detect(cc, "chest pain|chest pressure|palpitat|syncope|cardiac")           ~ "Cardiac",
+    str_detect(cc, "fever|cough|shortness of breath|sob|flu|uri|respiratory")      ~ "Respiratory / ILI",
+    str_detect(cc, "anxiety|panic|behavioral|agitat|psychiatric|suicid")           ~ "Mental Health",
+    str_detect(cc, "crush|trampl|stampede|crowd")                                  ~ "Crowd Crush",
+    TRUE                                                                            ~ "Other"
+  )
+}
+
+parse_cc <- function(raw, period_label) {
+  raw$dataDetails %>%
+    as_tibble() %>%
+    mutate(
+      syndrome = classify_cc(.data[[FIELD_CC]]),
+      period   = period_label
+    )
+}
+
+cc_current <- get_api_data(build_cc_url(EVENT_START, REPORT_END), profile = myProfile) %>%
+  parse_cc("This Year")
+
+cc_yoy <- get_api_data(build_cc_url(YOY_START, YOY_END), profile = myProfile) %>%
+  parse_cc("Prior Year (YOY)")
+
+cc_summary <- bind_rows(cc_current, cc_yoy) %>%
+  count(syndrome, period) %>%
+  pivot_wider(names_from = period, values_from = n, values_fill = 0) %>%
+  rename(current = `This Year`, yoy = `Prior Year (YOY)`) %>%
+  mutate(
+    pct_change   = if_else(yoy == 0, NA_real_, round((current - yoy) / yoy * 100, 1)),
+    change_label = case_when(
+      is.na(pct_change) ~ "N/A",
+      pct_change  > 0   ~ glue("+{pct_change}%"),
+      TRUE              ~ glue("{pct_change}%")
+    )
+  ) %>%
+  arrange(desc(current))
+
+# Derive facility list from live data — no hardcoding
+facility_list <- cc_current %>%
+  distinct(.data[[FIELD_FACILITY]]) %>%
+  arrange(.data[[FIELD_FACILITY]]) %>%
+  pull(1) %>%
+  paste(collapse = ", ")
+```
+
+```{r pull_icd, include=FALSE}
+build_icd_url <- function(start, end) {
+  glue(
+    "{ESSENCE_BASE}/api/dataDetails",
+    "?endDate={api_date(end)}",
+    "&startDate={api_date(start)}",
+    "&datasource={DATASOURCE}",
+    "&hasBeenE=1",
+    "&ddAvailable=1",
+    "&aqtTarget=DataDetails"
+  )
+}
+
+classify_icd <- function(icd) {
+  case_when(
+    str_detect(icd, "^T67")            ~ "Heat Illness (T67)",
+    str_detect(icd, "^E86")            ~ "Dehydration (E86)",
+    str_detect(icd, "^W52")            ~ "Crowd Crush (W52)",
+    str_detect(icd, "^T40")            ~ "Drug Toxicity / Opioid (T40)",
+    str_detect(icd, "^F10|^T51")       ~ "Alcohol-Related (F10 / T51)",
+    str_detect(icd, "^A09|^R11")       ~ "Food Poisoning / GI (A09 / R11)",
+    str_detect(icd, "^I46")            ~ "Cardiac Arrest (I46)",
+    str_detect(icd, "^R55")            ~ "Syncope / Collapse (R55)",
+    str_detect(icd, "^J06|^J11|^J18")  ~ "Respiratory / ILI (J06-J18)",
+    str_detect(icd, "^F41")            ~ "Panic / Anxiety (F41)",
+    str_detect(icd, "^T78\\.2|^L50")   ~ "Anaphylaxis / Allergy",
+    str_detect(icd, "^S|^T1[0-4]")     ~ "Traumatic Injury (S / T)",
+    str_detect(icd, "^Y04|^T74")       ~ "Assault / Violence (Y04 / T74)",
+    TRUE                               ~ NA_character_
+  )
+}
+
+parse_icd <- function(raw, period_label) {
+  raw$dataDetails %>%
+    as_tibble() %>%
+    mutate(icd_raw = str_split(.data[[FIELD_ICD]], "\\|")) %>%
+    unnest(icd_raw) %>%
+    mutate(
+      icd_code = str_trim(icd_raw),
+      category = classify_icd(icd_code),
+      period   = period_label
+    ) %>%
+    filter(!is.na(category))
+}
+
+icd_current <- get_api_data(build_icd_url(EVENT_START, REPORT_END), profile = myProfile) %>%
+  parse_icd("This Year")
+
+icd_yoy <- get_api_data(build_icd_url(YOY_START, YOY_END), profile = myProfile) %>%
+  parse_icd("Prior Year (YOY)")
+
+icd_summary <- bind_rows(icd_current, icd_yoy) %>%
+  count(category, period) %>%
+  pivot_wider(names_from = period, values_from = n, values_fill = 0) %>%
+  rename(current = `This Year`, yoy = `Prior Year (YOY)`) %>%
+  mutate(
+    pct_change   = if_else(yoy == 0, NA_real_, round((current - yoy) / yoy * 100, 1)),
+    change_label = case_when(
+      is.na(pct_change) ~ "N/A",
+      pct_change  > 0   ~ glue("+{pct_change}%"),
+      TRUE              ~ glue("{pct_change}%")
+    )
+  ) %>%
+  arrange(desc(current))
+```
+
+```{r data_quality, include=FALSE}
+# CC completeness — derived from the live pull, no manual entry
+cc_quality <- cc_current %>%
+  group_by(facility = .data[[FIELD_FACILITY]]) %>%
+  summarise(
+    total_visits    = n(),
+    cc_present      = sum(!is.na(.data[[FIELD_CC]]) & .data[[FIELD_CC]] != ""),
+    cc_completeness = round(cc_present / total_visits * 100, 1),
+    .groups         = "drop"
+  )
+
+# ICD-10 lag — derived from difference between visit date and DD date
+icd_quality <- icd_current %>%
+  mutate(
+    visit_dt = as.Date(.data[[FIELD_VISIT_DATE]], "%m/%d/%Y"),
+    dd_dt    = as.Date(.data[[FIELD_DD_DATE]],    "%m/%d/%Y"),
+    lag_hrs  = as.numeric(difftime(dd_dt, visit_dt, units = "hours"))
+  ) %>%
+  group_by(facility = .data[[FIELD_FACILITY]]) %>%
+  summarise(
+    avg_lag_hrs = round(mean(lag_hrs, na.rm = TRUE), 1),
+    .groups     = "drop"
+  )
+
+data_quality <- cc_quality %>%
+  left_join(icd_quality, by = "facility") %>%
+  mutate(
+    lag_display = if_else(is.na(avg_lag_hrs), "No ICD data yet", as.character(avg_lag_hrs))
+  )
+```
+
+---
+
+# `r glue("{EVENT_NAME} \u2014 Syndromic Surveillance Update")`
+
+| | |
+|:--|:--|
+| **Report period** | `r report_label` |
+| **YOY comparison** | `r yoy_label` |
+| **Facilities** | `r facility_list` |
+| **Prepared by** | `r params$analyst_name` |
+| **Prepared** | `r format(Sys.Date(), "%B %d, %Y")` |
+| **Distribution** | `r params$distribution` |
+
+---
+
+## 1. ED Visit Volume
+
+```{r ts_plot, fig.cap="Daily ED visit counts — current event period vs. same dates one year ago."}
+ggplot(ts_combined, aes(x = date, y = count, color = period, linetype = period)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2) +
+  scale_color_manual(
+    values = c("This Year" = "#1F4E79", "Prior Year (YOY)" = "#ED7D31")
+  ) +
+  scale_linetype_manual(
+    values = c("This Year" = "solid", "Prior Year (YOY)" = "dashed")
+  ) +
+  scale_x_date(date_labels = "%b %d", date_breaks = "1 day") +
+  scale_y_continuous(labels = comma, limits = c(0, NA)) +
+  labs(
+    title    = glue("Daily ED Visits \u2014 {EVENT_NAME}"),
+    subtitle = glue("Current: {report_label}  |  YOY: {yoy_label}"),
+    x = NULL, y = "ED Visits", color = NULL, linetype = NULL
+  ) +
+  theme_minimal(base_family = "Arial", base_size = 10) +
+  theme(
+    axis.text.x      = element_text(angle = 45, hjust = 1),
+    panel.grid.minor = element_blank(),
+    legend.position  = "bottom"
+  )
+```
+
+```{r ts_table}
+ts_table %>%
+  select(date_label, current, yoy, change_label) %>%
+  rename(
+    Date                      = date_label,
+    `This Year`               = current,
+    `Prior Year (Same Dates)` = yoy,
+    `% Change`                = change_label
+  ) %>%
+  flextable() %>%
+  bold(part = "header") %>%
+  bg(part = "header", bg = "#BDD7EE") %>%
+  bg(i = seq(1, nrow(ts_table), 2), bg = "#DEEAF1") %>%
+  color(i = which(ts_table$flag), j = "% Change", color = "#C00000") %>%
+  bold(i = which(ts_table$flag), j = "% Change") %>%
+  align(j = 2:4, align = "center", part = "all") %>%
+  border_outer(part = "all", border = fp_border(color = "#BFBFBF", width = 1)) %>%
+  border_inner(border = fp_border(color = "#BFBFBF", width = 0.5)) %>%
+  set_caption("Daily ED visit counts: this year vs. same dates one year ago") %>%
+  autofit()
+```
+
+---
+
+## 2. Priority Syndrome Comparison (Year-over-Year)
+
+```{r syndrome_yoy_table}
+priority_syndromes <- c("Heat Illness", "Traumatic Injury", "Alcohol / ETOH", "Food Poisoning / GI")
+
+priority_df <- cc_summary %>%
+  filter(syndrome %in% priority_syndromes) %>%
+  mutate(syndrome = factor(syndrome, levels = priority_syndromes)) %>%
+  arrange(syndrome)
+
+priority_df %>%
+  select(syndrome, current, yoy, change_label) %>%
+  rename(
+    Syndrome                  = syndrome,
+    `This Year`               = current,
+    `Prior Year (Same Dates)` = yoy,
+    `% Change`                = change_label
+  ) %>%
+  flextable() %>%
+  bold(part = "header") %>%
+  bg(part = "header", bg = "#BDD7EE") %>%
+  bg(i = seq(1, nrow(priority_df), 2), bg = "#DEEAF1") %>%
+  color(i = which(priority_df$pct_change > 20), j = "% Change", color = "#C00000") %>%
+  bold(i  = which(priority_df$pct_change > 20), j = "% Change") %>%
+  align(j = 2:4, align = "center", part = "all") %>%
+  border_outer(part = "all", border = fp_border(color = "#BFBFBF", width = 1)) %>%
+  border_inner(border = fp_border(color = "#BFBFBF", width = 0.5)) %>%
+  set_caption("Priority syndrome counts: this year vs. same dates one year ago (chief complaint)") %>%
+  autofit()
+```
+
+---
+
+## 3. All Chief Complaint Categories
+
+```{r cc_table}
+cc_display <- cc_summary %>% filter(syndrome != "Other")
+
+cc_display %>%
+  select(syndrome, current, yoy, change_label) %>%
+  rename(
+    `Syndrome Category`       = syndrome,
+    `This Year`               = current,
+    `Prior Year (Same Dates)` = yoy,
+    `% Change`                = change_label
+  ) %>%
+  flextable() %>%
+  bold(part = "header") %>%
+  bg(part = "header", bg = "#BDD7EE") %>%
+  bg(i = seq(1, nrow(cc_display), 2), bg = "#DEEAF1") %>%
+  align(j = 2:4, align = "center", part = "all") %>%
+  border_outer(part = "all", border = fp_border(color = "#BFBFBF", width = 1)) %>%
+  border_inner(border = fp_border(color = "#BFBFBF", width = 0.5)) %>%
+  set_caption("All chief complaint syndrome categories: this year vs. same dates one year ago") %>%
+  autofit()
+```
+
+---
+
+## 4. ICD-10 Discharge Diagnosis Counts
+
+> Discharge diagnosis data lags chief complaint by 12–48 hours.
+
+```{r icd_table}
+zero_tolerance <- c("Crowd Crush", "Cardiac Arrest", "Assault")
+flag_rows <- which(
+  str_detect(icd_summary$category, paste(zero_tolerance, collapse = "|")) &
+  icd_summary$current > 0
+)
+
+icd_summary %>%
+  select(category, current, yoy, change_label) %>%
+  rename(
+    `ICD-10 Category`         = category,
+    `This Year`               = current,
+    `Prior Year (Same Dates)` = yoy,
+    `% Change`                = change_label
+  ) %>%
+  flextable() %>%
+  bold(part = "header") %>%
+  bg(part = "header", bg = "#BDD7EE") %>%
+  bg(i = seq(1, nrow(icd_summary), 2), bg = "#DEEAF1") %>%
+  color(i = flag_rows, j = "This Year", color = "#C00000") %>%
+  bold(i  = flag_rows, j = "This Year") %>%
+  align(j = 2:4, align = "center", part = "all") %>%
+  border_outer(part = "all", border = fp_border(color = "#BFBFBF", width = 1)) %>%
+  border_inner(border = fp_border(color = "#BFBFBF", width = 0.5)) %>%
+  set_caption("ICD-10 discharge diagnosis counts: this year vs. same dates one year ago") %>%
+  autofit()
+```
+
+---
+
+## 5. Data Quality
+
+```{r data_quality_table}
+flag_dq <- which(data_quality$cc_completeness < 95)
+
+data_quality %>%
+  select(facility, total_visits, cc_completeness, lag_display) %>%
+  rename(
+    Facility               = facility,
+    `Total Visits`         = total_visits,
+    `CC Completeness (%)`  = cc_completeness,
+    `ICD-10 Avg Lag (hrs)` = lag_display
+  ) %>%
+  flextable() %>%
+  bold(part = "header") %>%
+  bg(part = "header", bg = "#BDD7EE") %>%
+  bg(i = seq(1, nrow(data_quality), 2), bg = "#DEEAF1") %>%
+  color(i = flag_dq, j = "CC Completeness (%)", color = "#ED7D31") %>%
+  bold(i  = flag_dq, j = "CC Completeness (%)") %>%
+  align(j = 2:4, align = "center", part = "all") %>%
+  border_outer(part = "all", border = fp_border(color = "#BFBFBF", width = 1)) %>%
+  border_inner(border = fp_border(color = "#BFBFBF", width = 0.5)) %>%
+  set_caption("Data completeness and ICD-10 discharge diagnosis lag by facility") %>%
+  autofit()
+```
+
+---
+
+*Next scheduled report: `r next_report_date`*  
+*Distribution: `r params$distribution`*  
+*Official use only — not for public release without authorization.*
