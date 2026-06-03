@@ -1,0 +1,544 @@
+---
+title: "2026 FIFA World Cup Syndromic Surveillance"
+subtitle: "Weekly Update"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  officedown::rdocx_document:
+    reference_docx: "reference_template.docx"
+    tables:
+      style: "Table Grid"
+      caption:
+        style: "Table Caption"
+    plots:
+      style: "Normal"
+      align: "center"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 6.5,
+  fig.height = 3.5,
+  dpi     = 150
+)
+
+library(Rnssp)
+library(tidyverse)
+library(flextable)
+library(officer)
+library(officedown)
+library(lubridate)
+library(scales)
+
+# ── Edit these each reporting period ─────────────────────────────────────────
+
+EVENT_NAME    <- "2026 FIFA World Cup"
+EVENT_START   <- as.Date("2026-06-01")   # first day of event surveillance
+EVENT_END     <- as.Date("2026-07-19")   # last day of event
+REPORT_START  <- as.Date("2026-06-01")   # start of THIS report period
+REPORT_END    <- min(as.Date("2026-06-07"), Sys.Date())  # end of THIS report period
+ANALYST_NAME  <- "Jane Smith, MPH"
+BUREAU        <- "Bureau of Epidemiology"
+DISTRIBUTION  <- "Surveillance Unit, Health Officer, EOC"
+
+# Chart always anchors one week before EVENT_START regardless of report week
+CHART_START   <- EVENT_START - days(7)
+
+# ESSENCE field names — confirm with names(raw$dataDetails) on first run
+FIELD_CC       <- "chiefComplaintOrig"
+FIELD_ICD      <- "ddInformationText"
+FIELD_FACILITY <- "facilityName"
+FIELD_REGION   <- "NH_region"
+
+# ── Signal status thresholds ──────────────────────────────────────────────────
+# Tune these as the event progresses
+THRESH_ELEVATED <- 20   # % change above prior year triggers ELEVATED
+THRESH_ALERT    <- 50   # % change above prior year triggers ALERT
+
+# ── Derived — do not edit ─────────────────────────────────────────────────────
+YOY_START     <- REPORT_START - years(1)
+YOY_END       <- REPORT_END   - years(1)
+CHART_YOY     <- CHART_START  - years(1)
+
+api_date <- function(d) format(as.Date(d), "%d%b%y")  # e.g. 01Jun26
+
+report_label <- paste0(format(REPORT_START, "%B %d"),
+                        " \u2013 ",
+                        format(REPORT_END, "%B %d, %Y"))
+yoy_label    <- paste0(format(YOY_START, "%B %d"),
+                        " \u2013 ",
+                        format(YOY_END, "%B %d, %Y"))
+next_report  <- format(REPORT_END + days(7), "%B %d, %Y")
+
+signal_status <- function(pct_change) {
+  case_when(
+    is.na(pct_change)              ~ "NORMAL",
+    pct_change >= THRESH_ALERT    ~ "ALERT",
+    pct_change >= THRESH_ELEVATED ~ "ELEVATED",
+    TRUE                           ~ "NORMAL"
+  )
+}
+
+set_flextable_defaults(font.family = "Verdana", font.size = 10)
+```
+
+```{r auth, include=FALSE}
+# Credentials stored in .Renviron — run usethis::edit_r_environ() to set:
+#   ESSENCE_USER=you@health.gov
+#   ESSENCE_PASS=yourpassword
+
+myProfile <- create_profile(
+  username = Sys.getenv("ESSENCE_USER"),
+  password = Sys.getenv("ESSENCE_PASS")
+)
+```
+
+```{r ts_functions, include=FALSE}
+# ── Time series parse function ────────────────────────────────────────────────
+parse_ts <- function(raw, period_label) {
+  raw$timeSeriesData %>%
+    as_tibble() %>%
+    filter(!is.na(date), date != "") %>%
+    mutate(
+      date   = as.Date(date),
+      count  = as.numeric(count),
+      period = period_label
+    )
+}
+```
+
+```{r pull_timeseries, include=FALSE}
+# ── API CALL: Statewide daily ED visit counts, current report period ──────────
+# Data type: Time Series | All facilities statewide | No syndrome filter
+# PASTE YOUR WORKING TIME SERIES URL BELOW, replacing hard-coded dates with:
+#   api_date(REPORT_START) and api_date(REPORT_END)
+
+ts_current <- get_api_data(
+  paste0(
+    # PASTE YOUR BASE URL HERE
+    "&startDate=", api_date(REPORT_START),
+    "&endDate=",   api_date(REPORT_END)
+    # ADD REMAINING URL PARAMETERS HERE
+  ),
+  profile = myProfile
+) %>% parse_ts("This Year")
+
+# ── API CALL: Statewide daily ED visit counts, prior year same dates ──────────
+# Same query as above but for YOY comparison window
+
+ts_yoy <- get_api_data(
+  paste0(
+    # PASTE YOUR BASE URL HERE
+    "&startDate=", api_date(YOY_START),
+    "&endDate=",   api_date(YOY_END)
+    # ADD REMAINING URL PARAMETERS HERE
+  ),
+  profile = myProfile
+) %>% parse_ts("Prior Year (YOY)")
+
+# ── API CALL: Extended time series for volume chart (anchored to CHART_START) ─
+# Same query structure, wider date window starting one week before EVENT_START
+
+ts_chart_current <- get_api_data(
+  paste0(
+    # PASTE YOUR BASE URL HERE
+    "&startDate=", api_date(CHART_START),
+    "&endDate=",   api_date(REPORT_END)
+    # ADD REMAINING URL PARAMETERS HERE
+  ),
+  profile = myProfile
+) %>% parse_ts("This Year")
+
+ts_chart_yoy <- get_api_data(
+  paste0(
+    # PASTE YOUR BASE URL HERE
+    "&startDate=", api_date(CHART_YOY),
+    "&endDate=",   api_date(YOY_END)
+    # ADD REMAINING URL PARAMETERS HERE
+  ),
+  profile = myProfile
+) %>% parse_ts("Prior Year (YOY)")
+
+# Align YOY dates forward one year for plotting on same x-axis
+ts_chart_yoy_aligned <- ts_chart_yoy %>% mutate(date = date + years(1))
+ts_chart_combined    <- bind_rows(ts_chart_current, ts_chart_yoy_aligned)
+
+# Summary totals for signal table volume row
+vol_current <- sum(ts_current$count, na.rm = TRUE)
+vol_yoy     <- sum(ts_yoy$count,     na.rm = TRUE)
+vol_pct     <- round((vol_current - vol_yoy) / vol_yoy * 100, 1)
+
+# Daily table for report
+ts_table <- ts_current %>%
+  select(date, count) %>%
+  rename(current = count) %>%
+  left_join(
+    ts_yoy %>%
+      mutate(date = date + years(1)) %>%
+      select(date, count) %>%
+      rename(yoy = count),
+    by = "date"
+  ) %>%
+  mutate(
+    pct_change   = if_else(
+      is.na(yoy) | yoy == 0, NA_real_,
+      round((current - yoy) / yoy * 100, 1)
+    ),
+    change_label = case_when(
+      is.na(pct_change) ~ "N/A",
+      pct_change > 0    ~ paste0("+", pct_change, "%"),
+      TRUE              ~ paste0(pct_change, "%")
+    ),
+    flag       = !is.na(pct_change) & pct_change > THRESH_ELEVATED,
+    date_label = format(date, "%a %b %d")
+  )
+```
+
+```{r cc_functions, include=FALSE}
+# ── Chief complaint classification ────────────────────────────────────────────
+classify_cc <- function(cc_text) {
+  cc <- tolower(cc_text)
+  case_when(
+    str_detect(cc, "heat|hypertherm|overheated|heat exhaustion|heat stroke")        ~ "Heat Illness",
+    str_detect(cc, "lacerat|fractur|fall|blunt|trauma|mvc|stab|gsw|assault|fight") ~ "Traumatic Injury",
+    str_detect(cc, "intox|etoh|drunk|alcohol|passed out|altered")                  ~ "Alcohol / ETOH",
+    str_detect(cc, "nausea|vomit|diarrhea|abdominal|abd pain|food poison|n/v")     ~ "Food Poisoning / GI",
+    str_detect(cc, "overdose|ingestion|opioid|fentanyl|narcan|naloxone")           ~ "Drug Toxicity",
+    str_detect(cc, "chest pain|chest pressure|palpitat|syncope|cardiac")           ~ "Cardiac",
+    str_detect(cc, "fever|cough|shortness of breath|sob|flu|uri|respiratory")      ~ "Respiratory / ILI",
+    str_detect(cc, "anxiety|panic|behavioral|agitat|psychiatric|suicid")           ~ "Mental Health",
+    str_detect(cc, "violence|assault|fight|weapon|shot|stab")                      ~ "Intentional Violence",
+    TRUE                                                                            ~ "Other"
+  )
+}
+
+parse_cc <- function(raw, period_label) {
+  raw$dataDetails %>%
+    as_tibble() %>%
+    mutate(
+      syndrome = classify_cc(.[[FIELD_CC]]),
+      period   = period_label
+    )
+}
+```
+
+```{r pull_cc, include=FALSE}
+# ── API CALL: Chief complaint detail records, current report period ────────────
+# Data type: Data Details | All facilities statewide | No syndrome filter
+# Returns one row per ED visit with raw CC text
+
+cc_current <- get_api_data(
+  paste0(
+    # PASTE YOUR BASE URL HERE
+    "&startDate=", api_date(REPORT_START),
+    "&endDate=",   api_date(REPORT_END)
+    # ADD REMAINING URL PARAMETERS HERE
+  ),
+  profile = myProfile
+) %>% parse_cc("This Year")
+
+# ── API CALL: Chief complaint detail records, prior year same dates ───────────
+
+cc_yoy <- get_api_data(
+  paste0(
+    # PASTE YOUR BASE URL HERE
+    "&startDate=", api_date(YOY_START),
+    "&endDate=",   api_date(YOY_END)
+    # ADD REMAINING URL PARAMETERS HERE
+  ),
+  profile = myProfile
+) %>% parse_cc("Prior Year (YOY)")
+
+# ── Summarise by syndrome and period ─────────────────────────────────────────
+cc_summary <- bind_rows(cc_current, cc_yoy) %>%
+  count(syndrome, period) %>%
+  pivot_wider(names_from = period, values_from = n, values_fill = 0) %>%
+  rename(current = `This Year`, yoy = `Prior Year (YOY)`) %>%
+  mutate(
+    pct_change   = if_else(yoy == 0, NA_real_,
+                           round((current - yoy) / yoy * 100, 1)),
+    change_label = case_when(
+      is.na(pct_change) ~ "N/A",
+      pct_change > 0    ~ paste0("+", pct_change, "%"),
+      TRUE              ~ paste0(pct_change, "%")
+    ),
+    status = signal_status(pct_change)
+  ) %>%
+  filter(syndrome != "Other") %>%
+  arrange(desc(current))
+```
+
+```{r icd_functions, include=FALSE}
+# ── ICD-10 classification via prefix matching on raw codes ────────────────────
+# Codes narrowed to event-relevant presentations only
+# Broad S/T traumatic injury range excluded; replaced with specific injury codes
+
+classify_icd <- function(icd) {
+  case_when(
+    str_detect(icd, "^T67")                    ~ "Heat Illness (T67)",
+    str_detect(icd, "^E86")                    ~ "Dehydration (E86)",
+    str_detect(icd, "^F10|^T51")               ~ "Alcohol-Related (F10 / T51)",
+    str_detect(icd, "^A09|^R11")               ~ "Food Poisoning / GI (A09 / R11)",
+    str_detect(icd, "^T40")                    ~ "Drug Toxicity / Opioid (T40)",
+    str_detect(icd, "^S0[1-9]|^S10|^S1[0-9]") ~ "Laceration / Open Wound (S01-S19)",
+    str_detect(icd, "^S[2-9][0-9]|^S[1-9][0-9][0-9]") ~ "Fracture (S-series)",
+    str_detect(icd, "^R55")                    ~ "Syncope / Collapse (R55)",
+    str_detect(icd, "^I46")                    ~ "Cardiac Arrest (I46)",
+    str_detect(icd, "^J06|^J11|^J12|^J18")    ~ "Respiratory / ILI (J06-J18)",
+    str_detect(icd, "^F41")                    ~ "Panic / Anxiety (F41)",
+    str_detect(icd, "^T78\\.2|^L50")           ~ "Anaphylaxis / Allergy",
+    str_detect(icd, "^Y04|^T74")               ~ "Assault / Violence (Y04 / T74)",
+    TRUE                                        ~ NA_character_
+  )
+}
+
+parse_icd <- function(raw, period_label) {
+  raw$dataDetails %>%
+    as_tibble() %>%
+    mutate(icd_split = str_split(.[[FIELD_ICD]], "\\|")) %>%
+    unnest(icd_split) %>%
+    mutate(
+      icd_code = str_trim(icd_split),
+      category = classify_icd(icd_code),
+      period   = period_label
+    ) %>%
+    filter(!is.na(category))
+}
+```
+
+```{r pull_icd, include=FALSE}
+# ── API CALL: ICD-10 discharge diagnosis records, current report period ────────
+# Data type: Data Details | ddAvailable=1 | All facilities statewide
+
+icd_current <- get_api_data(
+  paste0(
+    # PASTE YOUR BASE URL HERE
+    "&startDate=", api_date(REPORT_START),
+    "&endDate=",   api_date(REPORT_END)
+    # ADD REMAINING URL PARAMETERS HERE
+  ),
+  profile = myProfile
+) %>% parse_icd("This Year")
+
+# ── API CALL: ICD-10 discharge diagnosis records, prior year same dates ────────
+
+icd_yoy <- get_api_data(
+  paste0(
+    # PASTE YOUR BASE URL HERE
+    "&startDate=", api_date(YOY_START),
+    "&endDate=",   api_date(YOY_END)
+    # ADD REMAINING URL PARAMETERS HERE
+  ),
+  profile = myProfile
+) %>% parse_icd("Prior Year (YOY)")
+
+# ── Summarise by category and period ─────────────────────────────────────────
+icd_summary <- bind_rows(icd_current, icd_yoy) %>%
+  count(category, period) %>%
+  pivot_wider(names_from = period, values_from = n, values_fill = 0) %>%
+  rename(current = `This Year`, yoy = `Prior Year (YOY)`) %>%
+  mutate(
+    pct_change   = if_else(yoy == 0, NA_real_,
+                           round((current - yoy) / yoy * 100, 1)),
+    change_label = case_when(
+      is.na(pct_change) ~ "N/A",
+      pct_change > 0    ~ paste0("+", pct_change, "%"),
+      TRUE              ~ paste0(pct_change, "%")
+    ),
+    flag = !is.na(pct_change) & pct_change >= THRESH_ELEVATED
+  ) %>%
+  arrange(desc(current))
+```
+
+```{r build_signals, include=FALSE}
+# ── Assemble signals table from pulled data ───────────────────────────────────
+# Volume row sourced from time series; syndrome rows from CC summary
+
+signals <- bind_rows(
+  tibble(
+    syndrome     = "Total ED Visit Volume",
+    current      = vol_current,
+    yoy          = vol_yoy,
+    pct_change   = vol_pct,
+    change_label = if_else(vol_pct > 0,
+                           paste0("+", vol_pct, "%"),
+                           paste0(vol_pct, "%")),
+    status       = signal_status(vol_pct)
+  ),
+  cc_summary %>%
+    select(syndrome, current, yoy, pct_change, change_label, status)
+)
+```
+
+---
+
+# `r paste0(EVENT_NAME, " \u2014 Syndromic Surveillance Weekly Update")`
+
+**Report period:** `r report_label`
+**YOY comparison:** `r yoy_label`
+
+---
+
+## 1. Infectious Disease Detections of Interest
+
+<!-- MANUAL ENTRY: Replace the placeholder below with detections from your
+     review of visits of interest this reporting period. -->
+
+*For the week of `r report_label`, we detected ED encounters with CCs or DDs
+indicating the following reportable or unusual illness:*
+
+- No reportable or unusual infectious disease detections identified this
+  reporting period.
+
+---
+
+## 2. Syndromic Signals and Volume at a Glance
+
+```{r signals_table}
+# Color lookup
+status_fill <- function(s) case_when(
+  s == "ALERT"    ~ "FFB3B3",
+  s == "ELEVATED" ~ "FFE699",
+  TRUE            ~ "C6EFCE"
+)
+status_color <- function(s) case_when(
+  s == "ALERT"    ~ "C00000",
+  s == "ELEVATED" ~ "7F6000",
+  TRUE            ~ "375623"
+)
+
+ft <- signals %>%
+  select(syndrome, current, yoy, change_label, status) %>%
+  rename(
+    Signal              = syndrome,
+    `This Year`         = current,
+    `Prior Year`        = yoy,
+    `% Change`          = change_label,
+    Status              = status
+  ) %>%
+  flextable() %>%
+  bold(part = "header") %>%
+  bg(part = "header", bg = "#BDD7EE") %>%
+  width(j = 1, width = 2.6) %>%
+  width(j = 2, width = 1.0) %>%
+  width(j = 3, width = 1.0) %>%
+  width(j = 4, width = 1.0) %>%
+  width(j = 5, width = 1.2) %>%
+  align(j = 2:5, align = "center", part = "all") %>%
+  bold(j = 5) %>%
+  border_outer(part = "all", border = fp_border(color = "#BFBFBF", width = 1)) %>%
+  border_inner(border = fp_border(color = "#BFBFBF", width = 0.5)) %>%
+  set_caption("Syndromic signals and volume at a glance") %>%
+  bg(i = seq(2, nrow(signals), 2), bg = "#DEEAF1")
+
+# Apply status colors and flag elevated % change rows
+for (i in seq_len(nrow(signals))) {
+  ft <- ft %>%
+    bg(i = i, j = 5, bg = paste0("#", status_fill(signals$status[i]))) %>%
+    color(i = i, j = 5, color = paste0("#", status_color(signals$status[i])))
+
+  if (!is.na(signals$pct_change[i]) && signals$pct_change[i] >= THRESH_ELEVATED) {
+    ft <- ft %>%
+      color(i = i, j = 4, color = "#C00000") %>%
+      bold(i = i, j = 4)
+  }
+}
+
+ft
+```
+
+---
+
+## 3. Facility Volume
+
+<!-- MANUAL ENTRY: Add your narrative here noting any facilities with unusual
+     volume, feed issues, or contextual factors this reporting period. -->
+
+```{r volume_chart, fig.cap="Statewide daily ED visit counts: this year vs. prior year. Chart anchored one week before event start."}
+ggplot(ts_chart_combined, aes(x = date, y = count, fill = period)) +
+  geom_col(position = "dodge", width = 0.7) +
+  geom_vline(xintercept = as.numeric(EVENT_START) - 0.5,
+             linetype = "dashed", color = "#1F4E79", linewidth = 0.7) +
+  annotate("text", x = EVENT_START, y = max(ts_chart_combined$count) * 0.95,
+           label = "Event Start", hjust = -0.1, size = 3,
+           family = "Verdana", color = "#1F4E79") +
+  scale_fill_manual(values = c("This Year" = "#1F4E79", "Prior Year (YOY)" = "#ED7D31")) +
+  scale_x_date(date_labels = "%b %d", date_breaks = "3 days") +
+  scale_y_continuous(labels = comma, limits = c(0, NA)) +
+  labs(
+    title    = paste0("Statewide Daily ED Visits \u2014 ", EVENT_NAME),
+    subtitle = paste0("Chart period: ",
+                      format(CHART_START, "%B %d, %Y"),
+                      " through ",
+                      format(REPORT_END, "%B %d, %Y")),
+    x = NULL, y = "ED Visits", fill = NULL
+  ) +
+  theme_minimal(base_family = "Verdana", base_size = 10) +
+  theme(
+    axis.text.x      = element_text(angle = 45, hjust = 1),
+    panel.grid.minor = element_blank(),
+    legend.position  = "bottom"
+  )
+```
+
+```{r volume_table}
+ts_table %>%
+  select(date_label, current, yoy, change_label) %>%
+  rename(
+    Date                      = date_label,
+    `This Year`               = current,
+    `Prior Year (Same Dates)` = yoy,
+    `% Change`                = change_label
+  ) %>%
+  flextable() %>%
+  bold(part = "header") %>%
+  bg(part = "header", bg = "#BDD7EE") %>%
+  bg(i = seq(1, nrow(ts_table), 2), bg = "#DEEAF1") %>%
+  color(i = which(ts_table$flag), j = "% Change", color = "#C00000") %>%
+  bold(i = which(ts_table$flag), j = "% Change") %>%
+  align(j = 2:4, align = "center", part = "all") %>%
+  border_outer(part = "all", border = fp_border(color = "#BFBFBF", width = 1)) %>%
+  border_inner(border = fp_border(color = "#BFBFBF", width = 0.5)) %>%
+  set_caption("Daily statewide ED visit counts: this year vs. same dates one year ago") %>%
+  autofit()
+```
+
+---
+
+## 4. ICD-10 Discharge Diagnosis Counts
+
+*Discharge diagnosis data lags chief complaint by 12--48 hours. Traumatic
+injury codes are scoped to event-relevant presentations only.*
+
+```{r icd_table}
+icd_summary %>%
+  select(category, current, yoy, change_label, flag) %>%
+  rename(
+    `ICD-10 Category`         = category,
+    `This Year`               = current,
+    `Prior Year (Same Dates)` = yoy,
+    `% Change`                = change_label
+  ) %>%
+  flextable() %>%
+  bold(part = "header") %>%
+  bg(part = "header", bg = "#BDD7EE") %>%
+  bg(i = seq(1, nrow(icd_summary), 2), bg = "#DEEAF1") %>%
+  color(i = which(icd_summary$flag), j = "This Year",  color = "#C00000") %>%
+  bold(i  = which(icd_summary$flag), j = "This Year") %>%
+  color(i = which(icd_summary$flag), j = "% Change",   color = "#C00000") %>%
+  bold(i  = which(icd_summary$flag), j = "% Change") %>%
+  align(j = 2:4, align = "center", part = "all") %>%
+  border_outer(part = "all", border = fp_border(color = "#BFBFBF", width = 1)) %>%
+  border_inner(border = fp_border(color = "#BFBFBF", width = 0.5)) %>%
+  select(-flag) %>%
+  set_caption("ICD-10 discharge diagnosis counts: this year vs. same dates one year ago") %>%
+  autofit()
+```
+
+---
+
+*Prepared by: `r paste0(ANALYST_NAME, " \u2014 ", BUREAU)`*
+*Next report: `r next_report` | Distribution: `r DISTRIBUTION`*
+*Official use only \u2014 not for public release without authorization.*
